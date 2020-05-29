@@ -9,6 +9,7 @@
 #include <stdbool.h>
 #include <math.h>
 
+#include <pthread.h>
 #include <alsa/asoundlib.h>
 
 typedef int8_t i8;
@@ -807,7 +808,84 @@ static void read_sound_font(FILE *fp, SoundFont *sound_font, bool verbose) {
 	sound_font->nshdrs = nshdrs;
 }
 
+static time_t start_second;
+
+static void time_init(void) {
+	struct timespec timespec = {0};
+	clock_gettime(CLOCK_MONOTONIC, &timespec);
+	start_second = timespec.tv_sec;
+}
+
+static u64 time_ns(void) {
+	struct timespec timespec = {0};
+	clock_gettime(CLOCK_MONOTONIC, &timespec);
+	return (u64)(timespec.tv_sec - start_second) * 1000000000 + (u64)timespec.tv_nsec;
+}
+
+typedef struct {
+	u8 note;
+	u8 vel;
+	u64 t;
+} Note;
+
+typedef struct {
+	pthread_mutex_t mutex;
+	snd_pcm_t *pcm;
+	Instrument *instrument;
+	u32 nnotes;
+	Note notes[256];
+} SoundData;
+
+static void *sound_thread(void *vdata) {
+	SoundData *data = vdata;
+	snd_pcm_t *pcm = data->pcm;
+	i16 frames_L[800] = {0}, frames_R[800] = {0};
+	void *datas[] = {frames_L, frames_R};
+	int i = 0;
+	while (1) {
+		pthread_mutex_lock(&data->mutex);
+		Instrument *instrument = data->instrument;
+		size_t const nframes = sizeof frames_L / sizeof *frames_L;
+		for (Note *note = data->notes, *end = data->notes + data->nnotes;
+			note != end; ++note) {
+			u8 n = note->note;
+			Samples *samples_L = instrument->samples[2*n];
+			Samples *samples_R = instrument->samples[2*n+1];
+			if (!samples_L || !samples_R) {
+				die("No samples sorry.");
+			}
+			i16 *in_L = samples_L->data;
+			i16 *in_R = samples_R->data;
+			if (samples_R->count != samples_L->count) {
+				warn("Sample count for left channel doesn't match sample count for right channel.");
+				in_R = in_L;
+			}
+			i16 *out_L = frames_L, *out_R = frames_R;
+			for (u32 i = 0; i < nframes; ++i, ++in_L, ++in_R, ++out_L, ++out_R) {
+				*out_L = *in_L;
+				*out_R = *in_R;
+			}
+
+			printf("NOTE #%d: %u\n", i++, n);
+		}
+		pthread_mutex_unlock(&data->mutex);
+		snd_pcm_sframes_t frames = snd_pcm_writen(pcm, datas, nframes);
+		if (frames < 0)
+			frames = snd_pcm_recover(pcm, (int)frames, 0);
+		if (frames < 0) {
+			printf("snd_pcm_writei failed: %s\n", snd_strerror((int)frames));
+			break;
+		}
+		if (frames > 0 && frames < (snd_pcm_sframes_t)nframes) {
+			printf("Short write (expected %ld, wrote %ld)\n", (long)nframes, (long)frames);
+		}
+	}
+	return NULL;
+}
+
 int main(void) {
+	time_init();
+
 	char const *snd_dir = "/dev/snd";
 	DIR *dir = opendir(snd_dir);
 	// @TODO: option to use alsa
@@ -903,6 +981,7 @@ int main(void) {
 #endif
 	
 	snd_pcm_t *pcm = NULL;
+	SoundData sound = {0};
 	{
 		int err = 0;
 		char const *device = "default";
@@ -914,36 +993,30 @@ int main(void) {
 			die("Audio set params error: %s\n", snd_strerror(err));
 		}
 		snd_pcm_nonblock(pcm, 0); // always block
-		Samples *samples_L = instrument->samples[128];
-		Samples *samples_R = instrument->samples[129];
-		if (!samples_L || !samples_R) {
-			die("No samples sorry.");
-		}
-		i16 *data_L = samples_L->data;
-		i16 *data_R = samples_R->data;
-		u32 count = samples_L->count;
-		if (samples_R->count != count) {
-			warn("Sample count for left channel doesn't match sample count for right channel.");
-			data_R = data_L;
-		}
-		int i = 0;
-		while (1) {
-			printf("NOTE #%d\n", i++);
-			void *datas[] = {data_L, data_R};
-			snd_pcm_sframes_t frames = snd_pcm_writen(pcm, datas, count);
-			if (frames < 0)
-				frames = snd_pcm_recover(pcm, (int)frames, 0);
-			if (frames < 0) {
-				printf("snd_pcm_writei failed: %s\n", snd_strerror((int)frames));
-				break;
-			}
-			if (frames > 0 && frames < (snd_pcm_sframes_t)count) {
-				printf("Short write (expected %ld, wrote %ld)\n", (long)count, (long)frames);
-			}
+
+		sound.pcm = pcm;
+		sound.instrument = instrument;
+		pthread_mutex_init(&sound.mutex, NULL);
+		sound.nnotes = 1;
+		Note *note = &sound.notes[0];
+		note->note = 64;
+		note->vel = 127;
+		note->t = time_ns();
+
+		pthread_t sound_pthread;
+		if ((err = pthread_create(&sound_pthread, NULL, sound_thread, &sound))) {
+			die("Couldn't create thread (error %d).", err);
 		}
 	}
 
 	fclose(sndfont_fp);
+
+	while (1) {
+		pthread_mutex_lock(&sound.mutex);
+		++sound.notes[0].note;
+		pthread_mutex_unlock(&sound.mutex);
+		sleep(1);
+	}
 
 	return 0;
 
