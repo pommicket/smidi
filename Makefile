@@ -1,4 +1,4 @@
-OTHER_CFLAGS=-Wall -Wextra -Wconversion -Wno-unused-function -Wpedantic -pedantic -std=gnu11 -lm -lasound -pthread
+OTHER_CFLAGS=-Wall -Wextra -Wconversion -Wshadow -Wno-unused-function -Wpedantic -pedantic -std=gnu11 -lm -lasound -pthread
 DEBUG_CFLAGS=-O0 -g $(OTHER_CFLAGS)
 RELEASE_CFLAGS=-O3 -s $(OTHER_CFLAGS)
 midi: *.[ch]
