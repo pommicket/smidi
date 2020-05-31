@@ -881,9 +881,8 @@ static void *sound_thread(void *vdata) {
 	while (1) {
 #define nframes 441
 		float frames_fL[nframes] = {0.0f}, frames_fR[nframes] = {0.0f};
-		i16 frames_L[nframes], frames_R[nframes];
+		i16 frames[nframes * 2 /* 2 channels */];
 		float t_iter = (float)nframes / (float)data->sample_rate;
-		void *datas[] = {frames_L, frames_R};
 		sound_lock(data);
 		Instrument *instrument = data->instrument;
 		u8 n = 0;
@@ -954,36 +953,33 @@ static void *sound_thread(void *vdata) {
 		float multiplier_L = 30000.0f / max_sample_L;
 		float multiplier_R = 30000.0f / max_sample_R;
 		for (u32 i = 0; i < nframes; ++i) {
-			frames_L[i] = (i16)(multiplier_L * frames_fL[i]);
-			frames_R[i] = (i16)(multiplier_R * frames_fR[i]);
+			frames[2*i] = (i16)(multiplier_L * frames_fL[i]);
+			frames[2*i+1] = (i16)(multiplier_R * frames_fR[i]);
 		}
 		
 		if (data->out_wav) {
 			sound_lock(data);
 			if (data->out_wav_samples_written < U32_MAX) {
 				u64 new_samples_written = (u64)data->out_wav_samples_written + nframes;
-				if (new_samples_written * 2 /* channels */ * sizeof *frames_L >= U32_MAX - 100 /* to be safe */) {
+				if (new_samples_written * 2 /* channels */ * sizeof *frames >= U32_MAX - 100 /* to be safe */) {
 					warn("So... wav files can only have 4GB of audio data, and you've passed that. Stop recording now and start again.");
 					data->out_wav_samples_written = U32_MAX;
 				}
 				data->out_wav_samples_written = (u32)new_samples_written;
-				for (u32 i = 0; i < nframes; ++i) {
-					i16 things[] = {frames_L[i], frames_R[i]};
-					fwrite(things, sizeof *things, 2, data->out_wav);
-				}
+				fwrite(frames, sizeof *frames, arr_count(frames), data->out_wav);
 			}
 			sound_unlock(data);
 		}
 
-		snd_pcm_sframes_t frames = snd_pcm_writen(pcm, datas, nframes);
-		if (frames < 0)
-			frames = snd_pcm_recover(pcm, (int)frames, 0);
-		if (frames < 0) {
-			printf("snd_pcm_writei failed: %s\n", snd_strerror((int)frames));
+		snd_pcm_sframes_t frames_written = snd_pcm_writei(pcm, frames, nframes);
+		if (frames_written < 0)
+			frames_written = snd_pcm_recover(pcm, (int)frames_written, 0);
+		if (frames_written < 0) {
+			printf("snd_pcm_writei failed: %s\n", snd_strerror((int)frames_written));
 			break;
 		}
-		if (frames > 0 && frames < (snd_pcm_sframes_t)nframes) {
-			printf("Short write (expected %ld, wrote %ld)\n", (long)nframes, (long)frames);
+		if (frames_written > 0 && frames_written < (snd_pcm_sframes_t)nframes) {
+			printf("Short write (expected %ld, wrote %ld)\n", (long)nframes, (long)frames_written);
 		}
 	}
 	return NULL;
@@ -1121,7 +1117,7 @@ int main(int argc, char **argv) {
 			die("Playback open error: %s\n", snd_strerror(err));
 		}
 		sound->sample_rate = 44100;
-		if ((err = snd_pcm_set_params(pcm, SND_PCM_FORMAT_S16, SND_PCM_ACCESS_RW_NONINTERLEAVED,
+		if ((err = snd_pcm_set_params(pcm, SND_PCM_FORMAT_S16, SND_PCM_ACCESS_RW_INTERLEAVED,
 			2, sound->sample_rate, 1, 10000)) < 0) {
 			die("Audio set params error: %s\n", snd_strerror(err));
 		}
@@ -1159,7 +1155,7 @@ int main(int argc, char **argv) {
 
 	char *device_name = NULL;
 	if (ndevices == 0) {
-		die("No midi devices found.");
+		die("No midi controllers found.");
 	} else if (ndevices == 1) {
 		device_name = devices[0];
 	} else {
