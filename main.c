@@ -1,3 +1,10 @@
+#ifdef DEBUG
+#undef DEBUG
+#define DEBUG 1
+#else
+#define NDEBUG 1
+#endif
+
 #include <stdio.h>
 #include <stdlib.h>
 #include <stdarg.h>
@@ -10,6 +17,7 @@
 #include <math.h>
 #include <sys/stat.h>
 #include <errno.h>
+#include <signal.h>
 
 #include <pthread.h>
 #include <alsa/asoundlib.h>
@@ -330,7 +338,7 @@ static void load_instrument(SoundFont *sndfont, Instrument *inst) {
 		u16 sample_id = 0;
 		for (u32 i = start; i < end; ++i, ++gen) {
 			GenAmount amount = gen->amount;
-			print_gen(gen);
+			//print_gen(gen);
 			switch (gen->oper) {
 			case GEN_keyRange:
 				key_lo = amount.range.lo;
@@ -352,9 +360,8 @@ static void load_instrument(SoundFont *sndfont, Instrument *inst) {
 			continue;
 
 		if (root_key == U16_MAX) {
-			// just guess
-			warn("Root key not specified for instrument %s. Guessing.", inst->name);
-			root_key = (u16)((key_lo + key_hi) / 2);
+			warn("Root key not specified. Not using this sample.");
+			continue;
 		}
 		
 		assert(sample_id < sndfont->nshdrs);
@@ -944,8 +951,8 @@ static void *sound_thread(void *vdata) {
 			if (r > max_sample_R)
 				max_sample_R = r;
 		}
-		float multiplier_L = 32767.0f / max_sample_L;
-		float multiplier_R = 32767.0f / max_sample_R;
+		float multiplier_L = 30000.0f / max_sample_L;
+		float multiplier_R = 30000.0f / max_sample_R;
 		for (u32 i = 0; i < nframes; ++i) {
 			frames_L[i] = (i16)(multiplier_L * frames_fL[i]);
 			frames_R[i] = (i16)(multiplier_R * frames_fR[i]);
@@ -983,13 +990,79 @@ static void *sound_thread(void *vdata) {
 #undef nframes
 }
 
-int main(void) {
+static void finish_wav(SoundThreadData *sound) {
+	assert(sound->out_wav);
+	u32 data_chunk_size = sound->out_wav_samples_written * 4; // = # samples * byte rate
+	u32 riff_chunk_size = data_chunk_size + 36;
+	FILE *out_wav = sound->out_wav;
+	// fill in gaps
+	fseek(out_wav, 4, SEEK_SET);
+	write_u32(out_wav, riff_chunk_size);
+	fseek(out_wav, 40, SEEK_SET);
+	write_u32(out_wav, data_chunk_size);
+	fclose(out_wav);
+	printf("Stopped recording to wav file.\n");
+	sound->out_wav = NULL;
+}
+
+
+static SoundThreadData sound_thread_data;
+
+static void sighandler(int signum) {
+	switch (signum) {
+	case SIGSEGV:
+		fprintf(stderr, "Segmentation fault.\n");
+		break;
+	case SIGTERM:
+		fprintf(stderr, "Terminated.\n");
+		break;
+	case SIGINT:
+		fprintf(stderr, "Interrupted.\n");
+		break;
+	case SIGILL:
+		fprintf(stderr, "Illegal instruction.\n");
+		break;
+	case SIGABRT:
+		fprintf(stderr, "Aborted.\n");
+		break;
+	case SIGBUS:
+		fprintf(stderr, "Bus error.\n");
+		break;
+	case SIGFPE:
+		fprintf(stderr, "Floating-point exception.\n");
+		break;
+	default:
+		fprintf(stderr, "An error occured.\n");
+		break;
+	}
+	SoundThreadData *sound = &sound_thread_data;
+	if (sound->out_wav) {
+		finish_wav(sound);
+	}
+	exit(EXIT_FAILURE);
+}
+
+int main(int argc, char **argv) {
 	time_init();
 	
-
-	FILE *sndfont_fp = fopen("/usr/share/sounds/sf2/FluidR3_GM.sf2", "rb");
+	SoundThreadData *sound = &sound_thread_data;
+	signal(SIGINT, sighandler);
+#if NDEBUG
+	signal(SIGSEGV, sighandler);
+	signal(SIGTERM, sighandler);
+	signal(SIGILL, sighandler);
+	signal(SIGABRT, sighandler);
+	signal(SIGBUS, sighandler);
+	signal(SIGFPE, sighandler);
+#endif
+	
+	char const *sndfont_filename = "/usr/share/sounds/sf2/FluidR3_GM.sf2";
+	if (argc > 1) {
+		sndfont_filename = argv[1];
+	}
+	FILE *sndfont_fp = fopen(sndfont_filename, "rb");
 	if (!sndfont_fp) {
-		die("Couldn't open soundfont file.");
+		die("Couldn't open soundfont file: %s.", sndfont_filename);
 	}
 	SoundFont sound_font = {0};
 	read_sound_font(sndfont_fp, &sound_font, false);
@@ -1012,7 +1085,7 @@ int main(void) {
 			}
 		}
 		if (!default_inst) default_inst = &sound_font.insts[0];
-		printf("Instrument [default: %s]: ", default_inst->name);
+		printf("Instrument, enter a number from 1 to %u [default: %s]: ", (unsigned)ninsts-1, default_inst->name);
 		fflush(stdout);
 		
 		char line[64];
@@ -1041,26 +1114,25 @@ int main(void) {
 #endif
 	
 	snd_pcm_t *pcm = NULL;
-	SoundThreadData sound = {0};
 	{
 		int err = 0;
 		char const *audio_output_device = "default";
 		if ((err = snd_pcm_open(&pcm, audio_output_device, SND_PCM_STREAM_PLAYBACK, 0)) < 0) {
 			die("Playback open error: %s\n", snd_strerror(err));
 		}
-		sound.sample_rate = 44100;
+		sound->sample_rate = 44100;
 		if ((err = snd_pcm_set_params(pcm, SND_PCM_FORMAT_S16, SND_PCM_ACCESS_RW_NONINTERLEAVED,
-			2, sound.sample_rate, 1, 10000)) < 0) {
+			2, sound->sample_rate, 1, 10000)) < 0) {
 			die("Audio set params error: %s\n", snd_strerror(err));
 		}
 		snd_pcm_nonblock(pcm, 0); // always block
 
-		sound.pcm = pcm;
-		sound.instrument = instrument;
-		pthread_mutex_init(&sound.mutex, NULL);
+		sound->pcm = pcm;
+		sound->instrument = instrument;
+		pthread_mutex_init(&sound->mutex, NULL);
 
 		pthread_t sound_pthread;
-		if ((err = pthread_create(&sound_pthread, NULL, sound_thread, &sound))) {
+		if ((err = pthread_create(&sound_pthread, NULL, sound_thread, sound))) {
 			die("Couldn't create thread (error %d).", err);
 		}
 	}
@@ -1125,12 +1197,11 @@ int main(void) {
 		switch (top4) {
 		case 8: {
 			// Note off
-			// @TODO
 			u8 n = (u8)getc(device);
 			u8 v = (u8)getc(device);
 			if (n > 127 || v > 127) break;
-			sound_lock(&sound);
-			Note *note = &sound.notes[n];
+			sound_lock(sound);
+			Note *note = &sound->notes[n];
 			if (note->exists) {
 				note->down = false;
 				if (!sustain_pedal) {
@@ -1138,7 +1209,7 @@ int main(void) {
 					note->dampening = 1.0f;
 				}
 			}
-			sound_unlock(&sound);
+			sound_unlock(sound);
 		} break;
 		case 9: {
 			// Note on
@@ -1146,8 +1217,8 @@ int main(void) {
 			u8 v = (u8)getc(device);
 			if (n > 127 || v > 127) break;
 			if (feof(device)) break;
-			sound_lock(&sound);
-			Note *note = &sound.notes[n];
+			sound_lock(sound);
+			Note *note = &sound->notes[n];
 			if (note) {
 				note->exists = true;
 				note->vel = v;
@@ -1156,7 +1227,7 @@ int main(void) {
 				note->dampened = false;
 				note->down = true;
 			}
-			sound_unlock(&sound);
+			sound_unlock(sound);
 
 		} break;
 		case 11: { // controller
@@ -1165,24 +1236,24 @@ int main(void) {
 			if (controller > 127 || vel > 127) break;
 			if (controller == 64) {
 				// sustain pedal
-				sound_lock(&sound);
+				sound_lock(sound);
 				if (vel == 0) { // oddly, 0 velocity is down (at least on my keyboard)
 					sustain_pedal = true;
-					for (Note *no = sound.notes, *end = no + 128; no < end; ++no) {
+					for (Note *no = sound->notes, *end = no + 128; no < end; ++no) {
 						no->dampened = false;
 					}
 				} else if (vel == 127) {
 					sustain_pedal = false;
-					for (Note *no = sound.notes, *end = no + 128; no < end; ++no) {
+					for (Note *no = sound->notes, *end = no + 128; no < end; ++no) {
 						if (!no->down) {
 							no->dampened = true;
 						}
 					}
 				}
-				sound_unlock(&sound);
+				sound_unlock(sound);
 			} else if (controller == 48) {
 				// record to wav
-				sound_lock(&sound);
+				sound_lock(sound);
 				if (vel == 127) {
 					char filename[32] = {0};
 					for (u32 i = 1;;++i) {
@@ -1200,7 +1271,8 @@ int main(void) {
 					}
 					if (!*filename) break;
 					printf("Recording to %s.\n", filename);
-					FILE *out_wav = sound.out_wav = fopen(filename, "wb");
+					sound->out_wav_samples_written = 0;
+					FILE *out_wav = sound->out_wav = fopen(filename, "wb");
 					fwrite("RIFF", 1, 4, out_wav);
 					write_u32(out_wav, 0); // RIFF chunk size; we don't know this yet
 					fwrite("WAVE", 1, 4, out_wav);
@@ -1208,7 +1280,7 @@ int main(void) {
 					write_u32(out_wav, 16); // fmt  chunk size
 					write_u16(out_wav, 1); // sample rate
 					write_u16(out_wav, 2); // channels
-					u32 sample_rate = sound.sample_rate;
+					u32 sample_rate = sound->sample_rate;
 					write_u32(out_wav, sample_rate); // sample rate
 					write_u32(out_wav, sample_rate * 4); // byte rate (e.g. 44100 samples / sec * 2 bytes / sample * 2 channels)
 					write_u16(out_wav, 4); // block align (2 channels * 2 bytes per sample)
@@ -1217,21 +1289,11 @@ int main(void) {
 					write_u32(out_wav, 0); // don't know this yet
 					assert(ftell(out_wav) == 44);
 				} else {
-					if (sound.out_wav) {
-						u32 data_chunk_size = sound.out_wav_samples_written * 4; // = # samples * byte rate
-						u32 riff_chunk_size = data_chunk_size + 36;
-						FILE *out_wav = sound.out_wav;
-						// fill in gaps
-						fseek(out_wav, 4, SEEK_SET);
-						write_u32(out_wav, riff_chunk_size);
-						fseek(out_wav, 40, SEEK_SET);
-						write_u32(out_wav, data_chunk_size);
-						fclose(out_wav);
-						printf("Done recording wave file.\n");
-						sound.out_wav = NULL;
+					if (sound->out_wav) {
+						finish_wav(sound);
 					}
 				}
-				sound_unlock(&sound);
+				sound_unlock(sound);
 			} else {
 			#if 0
 				printf("%u %u\n",controller,vel);

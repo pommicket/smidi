@@ -1,8 +1,9 @@
 dump
 log
 out
-midi
+smidi
 tags
 TAGS
+*.sf2
 *.wav
 *~
