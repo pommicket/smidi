@@ -1,6 +1,6 @@
 ## sMIDI
 
-A simple program for using MIDI controllers on POSIX systems. 
+A simple program for using MIDI controllers on Linux.
 
 This is a replacement for programs like fluidsynth, because they're usually crazy and involve jack.
 So here's an alternative that doesn't take over your system's audio!
