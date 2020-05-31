@@ -35,3 +35,7 @@ smidi [soundfont file]
 ```
 
 The sustain pedal should work (at least it works for me), and controller #48 (button 1 on my keyboard) will start/stop recording to a wav file.
+
+### License
+
+sMIDI is in the public domain (licensed under the [unlicense](https://unlicense.org)). This means you can do whatever you want with it.
