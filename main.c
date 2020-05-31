@@ -8,6 +8,8 @@
 #include <stdint.h>
 #include <stdbool.h>
 #include <math.h>
+#include <sys/stat.h>
+#include <errno.h>
 
 #include <pthread.h>
 #include <alsa/asoundlib.h>
@@ -24,24 +26,32 @@ typedef uint64_t u64;
 
 #define U8_MAX 255
 #define U16_MAX 65535
+#define U32_MAX 4294967295
 
 #define arr_count(arr) (sizeof (arr) / sizeof *(arr))
 
-static inline u32 read_u32(FILE *fp) {
-	u32 x;
-	fread(&x, sizeof x, 1, fp);
-	return x;
+static inline u8 read_u8(FILE *fp) {
+	return (u8)getc(fp);
+}
+static inline i8 read_i8(FILE *fp) {
+	return (i8)getc(fp);
 }
 static inline u16 read_u16(FILE *fp) {
 	u16 x;
 	fread(&x, sizeof x, 1, fp);
 	return x;
 }
-static inline u8 read_u8(FILE *fp) {
-	return (u8)getc(fp);
+static inline u32 read_u32(FILE *fp) {
+	u32 x;
+	fread(&x, sizeof x, 1, fp);
+	return x;
 }
-static inline i8 read_i8(FILE *fp) {
-	return (i8)getc(fp);
+
+static inline void write_u16(FILE *fp, u16 x) {
+	fwrite(&x, sizeof x, 1, fp);
+}
+static inline void write_u32(FILE *fp, u32 x) {
+	fwrite(&x, sizeof x, 1, fp);
 }
 
 static void die(char const *fmt, ...) {
@@ -832,7 +842,7 @@ static u64 time_ns(void) {
 }
 
 typedef struct {
-	u8 note;
+	bool exists;
 	u8 vel;
 	bool dampened;
 	bool down; // this can be different from dampened if the sustain pedal is down
@@ -841,12 +851,13 @@ typedef struct {
 } Note;
 
 typedef struct {
+	u32 out_wav_samples_written;
+	FILE *out_wav;
 	pthread_mutex_t mutex;
 	snd_pcm_t *pcm;
 	Instrument *instrument;
 	u32 sample_rate;
-	u32 nnotes;
-	Note notes[256];
+	Note notes[128]; // [i] = Note #i
 } SoundThreadData;
 
 static inline void sound_lock(SoundThreadData *sound) {
@@ -855,8 +866,6 @@ static inline void sound_lock(SoundThreadData *sound) {
 static inline void sound_unlock(SoundThreadData *sound) {
 	pthread_mutex_unlock(&sound->mutex);
 }
-
-static FILE *out;
 
 static void *sound_thread(void *vdata) {
 	SoundThreadData *data = vdata;
@@ -870,10 +879,9 @@ static void *sound_thread(void *vdata) {
 		void *datas[] = {frames_L, frames_R};
 		sound_lock(data);
 		Instrument *instrument = data->instrument;
-		u32 nnotes = data->nnotes;
-		Note *note, *end;
-		for (note = data->notes, end = data->notes + nnotes; note != end; ++note) {
-			u8 n = note->note;
+		u8 n = 0;
+		for (Note *note = data->notes; n < 128; ++note, ++n) {
+			if (!note->exists) continue;
 			Samples *samples_L = instrument->samples[2*n];
 			Samples *samples_R = instrument->samples[2*n+1];
 			if (!samples_L || !samples_R) {
@@ -891,16 +899,17 @@ static void *sound_thread(void *vdata) {
 			int pitch_diff = n - samples_L->pitch;
 			float time_multiplier = (float)samples_L->sample_rate / (float)data->sample_rate * powf(2.0f, (float)pitch_diff / 12.0f); // stretch factor of input
 			i64 frames_left_in_sample = (i64)sample_frames - pos;
-			if (frames_left_in_sample <= 0)
-				goto delete_note;
-
+			if (frames_left_in_sample <= 0) {
+				note->exists = false;
+				continue;
+			}
 			{
 				float *out_L = frames_fL, *out_R = frames_fR;
 				float volume = (float)note->vel / 128.0f;
 				if (note->dampened) {
 					note->dampening *= powf(0.05f, t_iter);
-					volume *= note->dampening;
 				}
+				volume *= note->dampening; // this needs to be here always in case we get note off then sustain pedal off
 				float *out_end = frames_fL + nframes;
 				float in_idx = (float)pos;
 				volume /= 32767.0f; // turn 16-bit signed samples into floating point
@@ -919,15 +928,7 @@ static void *sound_thread(void *vdata) {
 			}
 
 			if (note->pos + (u32)time_multiplier >= sample_frames) {
-			delete_note:
-				--data->nnotes;
-				if (data->nnotes) {
-					// set *note to data->notes[data->nnotes-1], decrement end
-					*note = *--end;
-					--note;
-					continue;
-				}
-			} else {
+				note->exists = false;
 			}
 			//printf("NOTE: %d\n", note->note);
 		}
@@ -948,13 +949,25 @@ static void *sound_thread(void *vdata) {
 		for (u32 i = 0; i < nframes; ++i) {
 			frames_L[i] = (i16)(multiplier_L * frames_fL[i]);
 			frames_R[i] = (i16)(multiplier_R * frames_fR[i]);
-			if (nnotes == 0) {
-				assert(frames_L[i] == 0 && frames_R[i] == 0);
-			}
 		}
-			
-		fwrite(frames_R, sizeof *frames_R, nframes, out);
 		
+		if (data->out_wav) {
+			sound_lock(data);
+			if (data->out_wav_samples_written < U32_MAX) {
+				u64 new_samples_written = (u64)data->out_wav_samples_written + nframes;
+				if (new_samples_written * 2 /* channels */ * sizeof *frames_L >= U32_MAX - 100 /* to be safe */) {
+					warn("So... wav files can only have 4GB of audio data, and you've passed that. Stop recording now and start again.");
+					data->out_wav_samples_written = U32_MAX;
+				}
+				data->out_wav_samples_written = (u32)new_samples_written;
+				for (u32 i = 0; i < nframes; ++i) {
+					i16 things[] = {frames_L[i], frames_R[i]};
+					fwrite(things, sizeof *things, 2, data->out_wav);
+				}
+			}
+			sound_unlock(data);
+		}
+
 		snd_pcm_sframes_t frames = snd_pcm_writen(pcm, datas, nframes);
 		if (frames < 0)
 			frames = snd_pcm_recover(pcm, (int)frames, 0);
@@ -972,47 +985,6 @@ static void *sound_thread(void *vdata) {
 
 int main(void) {
 	time_init();
-	out = fopen("out", "wb");
-	char const *snd_dir = "/dev/snd";
-	DIR *dir = opendir(snd_dir);
-	// @TODO: option to use alsa
-	if (!dir) {
-		die("No %s. Can't find midi devices.", snd_dir);
-	}
-	struct dirent *ent = NULL;
-	
-	char *devices[100] = {0};
-	unsigned ndevices = 0;
-	while ((ent = readdir(dir))) {
-		char *name = ent->d_name;
-		if (strncmp(name, "midi", 4) == 0) {
-			if (ndevices < 100) {
-				devices[ndevices++] = strdup(name);
-			}
-		}
-	}
-	closedir(dir);
-
-	char *device = NULL;
-	if (ndevices == 0) {
-		die("No midi devices found.");
-	} else if (ndevices == 1) {
-		device = devices[0];
-	} else {
-		printf("Please select a MIDI device:\n");
-		for (unsigned i = 0; i < ndevices; ++i) 
-			printf("[%u] %s\n", i+1, devices[i]);
-		printf("Enter a number from %u to %u: ", 1, ndevices);
-		fflush(stdout);
-		unsigned device_num = 0;
-		if (scanf("%u", &device_num) < 1 || device_num < 1 || device_num > ndevices)
-			device_num = 1;
-		--device_num;
-		device = devices[device_num];
-	}
-
-	bool verbose = true;
-	if (verbose) printf("Using midi device %s.\n", device);
 	
 
 	FILE *sndfont_fp = fopen("/usr/share/sounds/sf2/FluidR3_GM.sf2", "rb");
@@ -1056,6 +1028,7 @@ int main(void) {
 	printf("Selecting instrument %s.\n", instrument->name);
 
 	load_instrument(&sound_font, instrument);
+	fclose(sndfont_fp);
 	if (!instrument->samples_loaded) {
 		die("That instrument has no samples. Your soundfont file doesn't actually support it, it seems.");
 	}
@@ -1085,21 +1058,6 @@ int main(void) {
 		sound.pcm = pcm;
 		sound.instrument = instrument;
 		pthread_mutex_init(&sound.mutex, NULL);
-		sound.nnotes = 0;
-		#if 0
-		Note *note = &sound.notes[0];
-		note->note = 64;
-		note->vel = 128;
-		note->pos = 0;
-		Note *n2 = &sound.notes[1];
-		n2->note = 67;
-		n2->vel = 128;
-		n2->pos = 0;
-		Note *n3 = &sound.notes[2];
-		n3->note = 71;
-		n3->vel = 128;
-		n3->pos = 0;
-		#endif
 
 		pthread_t sound_pthread;
 		if ((err = pthread_create(&sound_pthread, NULL, sound_thread, &sound))) {
@@ -1107,20 +1065,60 @@ int main(void) {
 		}
 	}
 
-	fclose(sndfont_fp);
+	char const *snd_dir = "/dev/snd";
+	DIR *dir = opendir(snd_dir);
+	// @TODO: option to use alsa
+	if (!dir) {
+		die("No %s. Can't find midi devices.", snd_dir);
+	}
+	struct dirent *ent = NULL;
+	
+	char *devices[100] = {0};
+	unsigned ndevices = 0;
+	while ((ent = readdir(dir))) {
+		char *name = ent->d_name;
+		if (strncmp(name, "midi", 4) == 0) {
+			if (ndevices < 100) {
+				devices[ndevices++] = strdup(name);
+			}
+		}
+	}
+	closedir(dir);
 
-	char *filename = malloc(32 + strlen(device));
-	sprintf(filename, "/dev/snd/%s", device);
+	char *device_name = NULL;
+	if (ndevices == 0) {
+		die("No midi devices found.");
+	} else if (ndevices == 1) {
+		device_name = devices[0];
+	} else {
+		printf("Please select a MIDI device:\n");
+		for (unsigned i = 0; i < ndevices; ++i) 
+			printf("[%u] %s\n", i+1, devices[i]);
+		printf("Enter a number from %u to %u: ", 1, ndevices);
+		fflush(stdout);
+		unsigned device_num = 0;
+		if (scanf("%u", &device_num) < 1 || device_num < 1 || device_num > ndevices)
+			device_num = 1;
+		--device_num;
+		device_name = devices[device_num];
+	}
 
-	FILE *file = fopen(filename, "rb");
-	if (!file) {
-		die("Couldn't access MIDI device %s.", filename);
+	bool verbose = true;
+	if (verbose) printf("Using midi device %s.\n", device_name);
+
+
+	char *device_filename = malloc(32 + strlen(device_name));
+	sprintf(device_filename, "/dev/snd/%s", device_name);
+
+	FILE *device = fopen(device_filename, "rb");
+	if (!device) {
+		die("Couldn't access MIDI device %s.", device_filename);
 	}
 	
 	bool sustain_pedal = false; // is the sustain pedal down?
 
 	while (1) {
-		int c = getc(file);
+		int c = getc(device);
 		if (c == EOF) break;
 		if (!(c & 0x80)) continue; // data
 		int top4 = (c & 0xf0) >> 4;
@@ -1128,42 +1126,33 @@ int main(void) {
 		case 8: {
 			// Note off
 			// @TODO
-			u8 n = (u8)getc(file);
-			u8 v = (u8)getc(file);
+			u8 n = (u8)getc(device);
+			u8 v = (u8)getc(device);
 			if (n > 127 || v > 127) break;
 			sound_lock(&sound);
-			for (Note *note = sound.notes, *end = note + sound.nnotes; note < end; ++note) {
-				if (note->note == n) {
-					note->down = false;
-					if (!sustain_pedal) {
-						note->dampened = true;
-						note->dampening = 1.0f;
-					}
+			Note *note = &sound.notes[n];
+			if (note->exists) {
+				note->down = false;
+				if (!sustain_pedal) {
+					note->dampened = true;
+					note->dampening = 1.0f;
 				}
 			}
 			sound_unlock(&sound);
 		} break;
 		case 9: {
 			// Note on
-			u8 n = (u8)getc(file);
-			u8 v = (u8)getc(file);
+			u8 n = (u8)getc(device);
+			u8 v = (u8)getc(device);
 			if (n > 127 || v > 127) break;
-			if (feof(file)) break;
+			if (feof(device)) break;
 			sound_lock(&sound);
-			Note *note = NULL;
-			for (Note *no = sound.notes, *end = no + sound.nnotes; no < end; ++no) {
-				if (no->note == n) {
-					note = no;
-				}
-			}
-
-			if (!note && sound.nnotes < arr_count(sound.notes)) {
-				note = &sound.notes[sound.nnotes++];
-			}
+			Note *note = &sound.notes[n];
 			if (note) {
-				note->note = n;
+				note->exists = true;
 				note->vel = v;
 				note->pos = 0;
+				note->dampening = 1;
 				note->dampened = false;
 				note->down = true;
 			}
@@ -1171,27 +1160,91 @@ int main(void) {
 
 		} break;
 		case 11: { // controller
-			u8 controller = (u8)getc(file);
-			u8 vel = (u8)getc(file);
+			u8 controller = (u8)getc(device);
+			u8 vel = (u8)getc(device);
 			if (controller > 127 || vel > 127) break;
 			if (controller == 64) {
 				// sustain pedal
+				sound_lock(&sound);
 				if (vel == 0) { // oddly, 0 velocity is down (at least on my keyboard)
 					sustain_pedal = true;
+					for (Note *no = sound.notes, *end = no + 128; no < end; ++no) {
+						no->dampened = false;
+					}
 				} else if (vel == 127) {
 					sustain_pedal = false;
-					for (Note *no = sound.notes, *end = no + sound.nnotes; no < end; ++no) {
-						if (!no->down)
+					for (Note *no = sound.notes, *end = no + 128; no < end; ++no) {
+						if (!no->down) {
 							no->dampened = true;
+						}
 					}
 				}
+				sound_unlock(&sound);
+			} else if (controller == 48) {
+				// record to wav
+				sound_lock(&sound);
+				if (vel == 127) {
+					char filename[32] = {0};
+					for (u32 i = 1;;++i) {
+						snprintf(filename, sizeof filename-1, "out-%02d.wav", i);
+						struct stat statbuf = {0};
+						if (stat(filename, &statbuf) < 0) {
+							if (errno == ENOENT) {
+								break;
+							} else {
+								warn("stat failed not recording.");
+								i = 0;
+								break;
+							}
+						}
+					}
+					if (!*filename) break;
+					printf("Recording to %s.\n", filename);
+					FILE *out_wav = sound.out_wav = fopen(filename, "wb");
+					fwrite("RIFF", 1, 4, out_wav);
+					write_u32(out_wav, 0); // RIFF chunk size; we don't know this yet
+					fwrite("WAVE", 1, 4, out_wav);
+					fwrite("fmt ", 1, 4, out_wav);
+					write_u32(out_wav, 16); // fmt  chunk size
+					write_u16(out_wav, 1); // sample rate
+					write_u16(out_wav, 2); // channels
+					u32 sample_rate = sound.sample_rate;
+					write_u32(out_wav, sample_rate); // sample rate
+					write_u32(out_wav, sample_rate * 4); // byte rate (e.g. 44100 samples / sec * 2 bytes / sample * 2 channels)
+					write_u16(out_wav, 4); // block align (2 channels * 2 bytes per sample)
+					write_u16(out_wav, 16); // bits per sample
+					fwrite("data", 1, 4, out_wav);
+					write_u32(out_wav, 0); // don't know this yet
+					assert(ftell(out_wav) == 44);
+				} else {
+					if (sound.out_wav) {
+						u32 data_chunk_size = sound.out_wav_samples_written * 4; // = # samples * byte rate
+						u32 riff_chunk_size = data_chunk_size + 36;
+						FILE *out_wav = sound.out_wav;
+						// fill in gaps
+						fseek(out_wav, 4, SEEK_SET);
+						write_u32(out_wav, riff_chunk_size);
+						fseek(out_wav, 40, SEEK_SET);
+						write_u32(out_wav, data_chunk_size);
+						fclose(out_wav);
+						printf("Done recording wave file.\n");
+						sound.out_wav = NULL;
+					}
+				}
+				sound_unlock(&sound);
+			} else {
+			#if 0
+				printf("%u %u\n",controller,vel);
+			#endif
 			}
 		} break;
 		default:
+		#if 0
 			printf("%d\n", top4);
+		#endif
 			break;
 		}
 	}
-	fclose(file);
+	fclose(device);
 	return 0;
 }
