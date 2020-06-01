@@ -975,6 +975,8 @@ static void *sound_thread(void *vdata) {
 			if (samples_R->count != samples_L->count) {
 				warn("Sample count for left channel doesn't match sample count for right channel.");
 				in_R = in_L;
+				samples_R = samples_L;
+				instrument->samples[2*n+1] = instrument->samples[2*n];
 			}
 			u32 pos = note->pos;
 
