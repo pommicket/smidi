@@ -32,6 +32,14 @@ For more information, please refer to <http://unlicense.org/>
 #define NDEBUG 1
 #endif
 
+// max full-volume notes without clipping (i haven't noticed any clipping
+// -- making this higher reduces clipping; making it lower will make smidi
+// louder)
+#define MAX_SIMULTANEOUS_NOTES 10
+
+#ifndef _GNU_SOURCE
+#define _GNU_SOURCE
+#endif
 #include <stdio.h>
 #include <stdlib.h>
 #include <stdarg.h>
@@ -43,6 +51,7 @@ For more information, please refer to <http://unlicense.org/>
 #include <stdbool.h>
 #include <math.h>
 #include <sys/stat.h>
+#include <sys/mman.h>
 #include <errno.h>
 #include <signal.h>
 
@@ -892,45 +901,15 @@ typedef struct {
 	u32 sample_rate;
 	Note notes[128]; // [i] = Note #i
 
-	FILE *out_wav;
-	u32 out_wav_samples_written;
+	bool out_wav;
+	i16 *out_wav_data; // we store this in memory to prevent underruns, then write it to disk at the end.
+	size_t out_wav_data_npages; // # of memory pages allocated for this
+	u32 out_wav_nframes;
+	
 	pthread_mutex_t output_mutex; // mutex specifically for output files, to be used instead of mutex
 } SoundThreadData;
 
-typedef struct {
-	SoundThreadData *sound;
-	pthread_mutex_t processing_sound;
-	pthread_mutex_t writing_sound;
-	i16 *data;
-} SoundWriteThreadData;
-
-#define nframes 441
-static void *sound_write_thread(void *vdata) {
-	SoundWriteThreadData *data = vdata;
-	SoundThreadData *sound = data->sound;
-
-	i16 buf[nframes * 2 /* channels */] = {0};
-
-	while (1) {
-		pthread_mutex_lock(&data->processing_sound); // wait until done processing sound
-		memcpy(buf, data->data, sizeof buf);
-		pthread_mutex_unlock(&data->writing_sound); // let sound thread continue
-		pthread_mutex_lock(&sound->output_mutex);
-		if (sound->out_wav) {
-			if (sound->out_wav_samples_written < U32_MAX) {
-				u64 new_samples_written = (u64)sound->out_wav_samples_written + nframes;
-				if (new_samples_written * 2 /* channels */ * sizeof *buf >= U32_MAX - 100 /* to be safe */) {
-					warn("So... wav files can only have 4GB of audio data, and you've passed that. Stop recording now and start again.");
-					sound->out_wav_samples_written = U32_MAX;
-				}
-				sound->out_wav_samples_written = (u32)new_samples_written;
-				fwrite(buf, sizeof *buf, arr_count(buf), sound->out_wav);
-			}
-		}
-		pthread_mutex_unlock(&sound->output_mutex);
-	}
-	return NULL;
-}
+static unsigned long page_size;
 
 static inline void sound_lock(SoundThreadData *sound) {
 	pthread_mutex_lock(&sound->mutex);
@@ -939,22 +918,63 @@ static inline void sound_unlock(SoundThreadData *sound) {
 	pthread_mutex_unlock(&sound->mutex);
 }
 
+static void finish_wav(SoundThreadData *sound, bool lock) {
+	if (lock) pthread_mutex_lock(&sound->output_mutex);
+	assert(sound->out_wav);
+	u32 data_chunk_size = sound->out_wav_nframes == U32_MAX ? U32_MAX : sound->out_wav_nframes * 4;
+	u32 riff_chunk_size = data_chunk_size + 36;
+
+	char filename[32] = {0};
+	for (u32 i = 1;;++i) {
+		snprintf(filename, sizeof filename-1, "out-%02d.wav", i);
+		struct stat statbuf = {0};
+		if (stat(filename, &statbuf) < 0) {
+			if (errno == ENOENT) {
+				break;
+			} else {
+				warn("stat failed not stopping.");
+				return;
+			}
+		}
+	}
+	printf("Saving to %s... ", filename); fflush(stdout);
+
+	FILE *fp = fopen(filename, "wb");
+	fwrite("RIFF", 1, 4, fp);
+	write_u32(fp, riff_chunk_size);
+	fwrite("WAVE", 1, 4, fp);
+	fwrite("fmt ", 1, 4, fp);
+	write_u32(fp, 16); // fmt  chunk size
+	write_u16(fp, 1); // sample rate
+	write_u16(fp, 2); // channels
+	u32 sample_rate = sound->sample_rate;
+	write_u32(fp, sample_rate); // sample rate
+	write_u32(fp, sample_rate * 4); // byte rate (e.g. 44100 samples / sec * 2 bytes / sample * 2 channels)
+	write_u16(fp, 4); // block align (2 channels * 2 bytes per sample)
+	write_u16(fp, 16); // bits per sample
+	fwrite("data", 1, 4, fp);
+	write_u32(fp, data_chunk_size);
+	fwrite(sound->out_wav_data, 1, data_chunk_size, fp);
+	fclose(fp);
+
+	printf("Saved!\n");
+
+	sound->out_wav_data = mremap(sound->out_wav_data, sound->out_wav_data_npages * page_size, page_size << 14,
+		MREMAP_MAYMOVE);
+	sound->out_wav = false;
+	sound->out_wav_data_npages = 1ul<<14;
+	sound->out_wav_nframes = 0;
+
+	if (lock) pthread_mutex_unlock(&sound->output_mutex);
+}
+
+
+#define nframes 441
 static void *sound_thread(void *vdata) {
 	SoundThreadData *data = vdata;
 	snd_pcm_t *pcm = data->pcm;
 	float frames_fL[nframes] = {0.0f}, frames_fR[nframes] = {0.0f};
 	i16 frames[nframes * 2 /* 2 channels */] = {0};
-
-	pthread_t write_thread;
-	SoundWriteThreadData write_data = {0};
-	write_data.sound = data;
-	pthread_mutex_init(&write_data.processing_sound, NULL);
-	pthread_mutex_init(&write_data.writing_sound, NULL);
-	pthread_mutex_lock(&write_data.writing_sound); // these need to start out locked
-	pthread_mutex_lock(&write_data.processing_sound); 
-	write_data.data = frames;
-
-	pthread_create(&write_thread, NULL, sound_write_thread, &write_data);
 
 	while (1) {
 		memset(frames_fL, 0, sizeof frames_fL);
@@ -997,7 +1017,8 @@ static void *sound_thread(void *vdata) {
 				volume *= note->dampening; // this needs to be here always in case we get note off then sustain pedal off
 				float *out_end = frames_fL + nframes;
 				float in_idx = (float)pos;
-				volume /= 32767.0f; // turn 16-bit signed samples into floating point
+				//volume /= 32767.0f; // turn 16-bit signed samples into floating point
+				volume /= MAX_SIMULTANEOUS_NOTES;
 				for (; out_L < out_end; ++out_L, ++out_R, in_idx += time_multiplier) {
 					u32 ii = (u32)in_idx;
 					if (ii >= sample_frames) {
@@ -1018,28 +1039,12 @@ static void *sound_thread(void *vdata) {
 			//printf("NOTE: %d\n", note->note);
 		}
 		sound_unlock(data);
-		// normalization
-		float max_sample_L = 1.0f; // default to 1 so we don't make quiet things loud
-		float max_sample_R = 1.0f; 
+
 		for (u32 i = 0; i < nframes; ++i) {
-			float l = fabsf(frames_fL[i]);
-			if (l > max_sample_L)
-				max_sample_L = l;
-			float r = fabsf(frames_fR[i]);
-			if (r > max_sample_R)
-				max_sample_R = r;
-		}
-		float multiplier_L = 30000.0f / max_sample_L;
-		float multiplier_R = 30000.0f / max_sample_R;
-		for (u32 i = 0; i < nframes; ++i) {
-			frames[2*i] = (i16)(multiplier_L * frames_fL[i]);
-			frames[2*i+1] = (i16)(multiplier_R * frames_fR[i]);
+			frames[2*i] = (i16)frames_fL[i];
+			frames[2*i+1] = (i16)frames_fR[i];
 		}
 		
-		pthread_mutex_unlock(&write_data.processing_sound);
-		pthread_mutex_lock(&write_data.writing_sound); // wait for write sound thread to copy into its own buffer
-
-
 		snd_pcm_sframes_t frames_written = snd_pcm_writei(pcm, frames, nframes);
 		if (frames_written < 0)
 			frames_written = snd_pcm_recover(pcm, (int)frames_written, 0);
@@ -1050,26 +1055,35 @@ static void *sound_thread(void *vdata) {
 		if (frames_written > 0 && frames_written < (snd_pcm_sframes_t)nframes) {
 			printf("Short write (expected %ld, wrote %ld)\n", (long)nframes, (long)frames_written);
 		}
+
+
+		if (data->out_wav) {
+			u64 old_data_len = (u64)data->out_wav_nframes * 2 /* channels */ * sizeof *frames;
+			u64 new_data_len = old_data_len + nframes * 2 * sizeof *frames; 
+			u64 curr_alloc_size = data->out_wav_data_npages * page_size;
+
+			pthread_mutex_lock(&data->output_mutex);
+			if (new_data_len >= U32_MAX - 100 /* to be safe */) {
+				printf("Cutting off recording (file too large for WAV format).\n");
+				finish_wav(data, false);
+			} else {
+				if (new_data_len > curr_alloc_size) {
+					size_t additional_pages = 1ul<<14;
+					size_t new_size = curr_alloc_size + page_size * additional_pages; // 64 MB on typical systems
+					data->out_wav_data = mremap(data->out_wav_data, curr_alloc_size, new_size,
+						MREMAP_MAYMOVE);
+					data->out_wav_data_npages += additional_pages;
+				}
+
+				memcpy((char *)data->out_wav_data + old_data_len,
+					frames, sizeof frames);
+				data->out_wav_nframes += nframes;
+			}
+			pthread_mutex_unlock(&data->output_mutex);
+		}
 	}
 	return NULL;
 #undef nframes
-}
-
-static void finish_wav(SoundThreadData *sound) {
-	pthread_mutex_lock(&sound->output_mutex);
-	assert(sound->out_wav);
-	u32 data_chunk_size = sound->out_wav_samples_written * 4; // = # samples * byte rate
-	u32 riff_chunk_size = data_chunk_size + 36;
-	FILE *out_wav = sound->out_wav;
-	// fill in gaps
-	fseek(out_wav, 4, SEEK_SET);
-	write_u32(out_wav, riff_chunk_size);
-	fseek(out_wav, 40, SEEK_SET);
-	write_u32(out_wav, data_chunk_size);
-	fclose(out_wav);
-	printf("Stopped recording to wav file.\n");
-	sound->out_wav = NULL;
-	pthread_mutex_unlock(&sound->output_mutex);
 }
 
 
@@ -1104,13 +1118,15 @@ static void sighandler(int signum) {
 	}
 	SoundThreadData *sound = &sound_thread_data;
 	if (sound->out_wav) {
-		finish_wav(sound);
+		finish_wav(sound, true);
 	}
 	exit(EXIT_FAILURE);
 }
 
 int main(int argc, char **argv) {
 	time_init();
+
+	page_size = (unsigned)sysconf(_SC_PAGE_SIZE);
 	
 	SoundThreadData *sound = &sound_thread_data;
 	signal(SIGINT, sighandler);
@@ -1122,7 +1138,7 @@ int main(int argc, char **argv) {
 	signal(SIGBUS, sighandler);
 	signal(SIGFPE, sighandler);
 #endif
-	
+
 	char const *sndfont_filename = "/usr/share/sounds/sf2/FluidR3_GM.sf2";
 	if (argc > 1) {
 		sndfont_filename = argv[1];
@@ -1197,6 +1213,11 @@ int main(int argc, char **argv) {
 		sound->pcm = pcm;
 		sound->instrument = instrument;
 		pthread_mutex_init(&sound->mutex, NULL);
+		pthread_mutex_init(&sound->output_mutex, NULL);
+
+		sound->out_wav_data = mmap(NULL, page_size << 14, PROT_READ|PROT_WRITE, MAP_ANONYMOUS|MAP_PRIVATE,
+			-1, 0);
+		sound->out_wav_data_npages = 1ul<<14;
 
 		pthread_t sound_pthread;
 		if ((err = pthread_create(&sound_pthread, NULL, sound_thread, sound))) {
@@ -1206,7 +1227,7 @@ int main(int argc, char **argv) {
 
 	char const *snd_dir = "/dev/snd";
 	DIR *dir = opendir(snd_dir);
-	// @TODO: option to use alsa
+	// @MAYBE_TODO: option to use alsa
 	if (!dir) {
 		die("No %s. Can't find midi devices.", snd_dir);
 	}
@@ -1322,45 +1343,12 @@ int main(int argc, char **argv) {
 				// record to wav
 				sound_lock(sound);
 				if (vel == 127) {
-					char filename[32] = {0};
-					for (u32 i = 1;;++i) {
-						snprintf(filename, sizeof filename-1, "out-%02d.wav", i);
-						struct stat statbuf = {0};
-						if (stat(filename, &statbuf) < 0) {
-							if (errno == ENOENT) {
-								break;
-							} else {
-								warn("stat failed not recording.");
-								i = 0;
-								break;
-							}
-						}
-					}
-					if (!*filename) break;
-					printf("Recording to %s.\n", filename);
 					pthread_mutex_lock(&sound->output_mutex);
-					sound->out_wav_samples_written = 0;
-					FILE *out_wav = sound->out_wav = fopen(filename, "wb");
-					fwrite("RIFF", 1, 4, out_wav);
-					write_u32(out_wav, 0); // RIFF chunk size; we don't know this yet
-					fwrite("WAVE", 1, 4, out_wav);
-					fwrite("fmt ", 1, 4, out_wav);
-					write_u32(out_wav, 16); // fmt  chunk size
-					write_u16(out_wav, 1); // sample rate
-					write_u16(out_wav, 2); // channels
-					u32 sample_rate = sound->sample_rate;
-					write_u32(out_wav, sample_rate); // sample rate
-					write_u32(out_wav, sample_rate * 4); // byte rate (e.g. 44100 samples / sec * 2 bytes / sample * 2 channels)
-					write_u16(out_wav, 4); // block align (2 channels * 2 bytes per sample)
-					write_u16(out_wav, 16); // bits per sample
-					fwrite("data", 1, 4, out_wav);
-					write_u32(out_wav, 0); // don't know this yet
-					assert(ftell(out_wav) == 44);
+					sound->out_wav = true;
 					pthread_mutex_unlock(&sound->output_mutex);
 				} else {
-					if (sound->out_wav) {
-						finish_wav(sound);
-					}
+					if (sound->out_wav)
+						finish_wav(sound, true);
 				}
 				sound_unlock(sound);
 			} else {
